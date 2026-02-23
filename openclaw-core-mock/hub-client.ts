@@ -1,5 +1,25 @@
 import { io, Socket } from 'socket.io-client';
 import axios from 'axios';
+import { randomUUID } from 'crypto';
+
+type HubAck = {
+    success: boolean;
+    status: 'accepted' | 'rejected';
+    semantics: 'accepted-for-routing-only';
+    code?: string;
+    error?: string;
+    messageId?: string;
+};
+
+type MessageEnvelope = {
+    messageId: string;
+    type: 'request-help' | 'direct-message' | 'broadcast';
+    senderId?: string;
+    targetId?: string;
+    topic?: string;
+    payload: unknown;
+    timestamp: string;
+};
 
 export class OpenClawHubClient {
     private socket: Socket | null = null;
@@ -47,17 +67,66 @@ export class OpenClawHubClient {
             console.log('Disconnected from Hub');
         });
 
+        this.socket.on('error', (err) => {
+            console.error('[Socket Error]', err);
+        });
+
+        this.socket.on('connect_error', (err) => {
+            console.error('[Socket Connect Error]', err.message);
+        });
+
         // Listen for incoming broadcasted collaboration requests
-        this.socket.on('broadcast', (data) => {
-            if (data.type === 'request-help') {
-                console.log(`\n[Broadcast] Agent ${data.senderId} needs help: ${data.taskDescription}`);
-                console.log(`Requires capabilities: ${data.requiredCapabilities.join(', ')}`);
+        this.socket.on('broadcast', (data: MessageEnvelope) => {
+            if (data.type === 'request-help' && typeof data.payload === 'object' && data.payload !== null) {
+                const payload = data.payload as { taskDescription?: string; requiredCapabilities?: string[] };
+                const taskDescription = payload.taskDescription || '(no description)';
+                const requiredCapabilities = Array.isArray(payload.requiredCapabilities)
+                    ? payload.requiredCapabilities.join(', ')
+                    : '(none)';
+
+                console.log(`\n[Broadcast] Agent ${data.senderId} needs help: ${taskDescription}`);
+                console.log(`Requires capabilities: ${requiredCapabilities}`);
                 // Here the local agent AI would decide to respond or ignore
             }
         });
 
-        this.socket.on('direct-message', (data) => {
+        this.socket.on('direct-message', (data: MessageEnvelope) => {
             console.log(`\n[Direct Message] From ${data.senderId}:`, data.payload);
+        });
+    }
+
+    private createEnvelope(
+        type: MessageEnvelope['type'],
+        payload: unknown,
+        routing?: { topic?: string; targetId?: string },
+    ): MessageEnvelope {
+        return {
+            messageId: randomUUID(),
+            type,
+            topic: routing?.topic,
+            targetId: routing?.targetId,
+            payload,
+            timestamp: new Date().toISOString(),
+        };
+    }
+
+    private emitWithAck(event: string, payload: unknown): Promise<HubAck> {
+        if (!this.socket) throw new Error('Not connected');
+
+        return new Promise((resolve, reject) => {
+            this.socket!.timeout(5000).emit(event, payload, (err: unknown, ack: HubAck) => {
+                if (err) {
+                    reject(new Error(`Ack timeout for ${event}`));
+                    return;
+                }
+
+                if (!ack?.success) {
+                    reject(new Error(ack?.error || ack?.code || `${event} rejected`));
+                    return;
+                }
+
+                resolve(ack);
+            });
         });
     }
 
@@ -72,8 +141,20 @@ export class OpenClawHubClient {
     }
 
     async broadcastRequestForHelp(taskDescription: string, requiredCapabilities: string[]) {
-        if (!this.socket) throw new Error('Not connected');
-        this.socket.emit('request-help', { taskDescription, requiredCapabilities });
+        const envelope = this.createEnvelope(
+            'request-help',
+            { taskDescription, requiredCapabilities },
+            { topic: 'global' },
+        );
+        return this.emitWithAck('request-help', envelope.payload);
+    }
+
+    async sendDirectMessage(targetId: string, payload: unknown) {
+        const envelope = this.createEnvelope('direct-message', payload, { targetId });
+        return this.emitWithAck('direct-message', {
+            targetId: envelope.targetId,
+            payload: envelope.payload,
+        });
     }
 
     disconnect() {

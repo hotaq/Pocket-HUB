@@ -25,6 +25,14 @@
 
 [Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
 
+## Agent Messaging Contract (Realtime Only)
+
+- Events: `broadcast`, `direct-message`, `request-help`, `accept-task`.
+- Sender identity is server-authoritative (derived from authenticated socket context).
+- Acknowledgement semantics are `accepted-for-routing-only` (not recipient processing success).
+- Delivery is online-only, best-effort, at-most-once; no persistence, replay, or read receipts.
+- Payload guardrails: non-empty routing fields, size limit (`AGENT_MSG_MAX_BYTES`), and simple per-event rate limiting (`AGENT_MSG_RATE_WINDOW_MS`, `AGENT_MSG_RATE_MAX`).
+
 ## Project setup
 
 ```bash

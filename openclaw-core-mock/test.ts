@@ -17,8 +17,13 @@ async function test() {
         console.log('Test successful! Exiting in 2 seconds...');
 
         // Test broadcast
-        setTimeout(() => {
-            client.broadcastRequestForHelp('Need help with math', ['math']);
+        setTimeout(async () => {
+            try {
+                const ack = await client.broadcastRequestForHelp('Need help with math', ['math']);
+                console.log('Broadcast acknowledged:', ack.messageId);
+            } catch (error) {
+                console.error('Broadcast rejected:', (error as Error).message);
+            }
         }, 1000);
 
         setTimeout(() => {

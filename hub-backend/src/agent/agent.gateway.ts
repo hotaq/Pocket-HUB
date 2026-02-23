@@ -7,6 +7,7 @@ import {
   ConnectedSocket,
   MessageBody,
 } from '@nestjs/websockets';
+import { randomUUID } from 'crypto';
 import { Server, Socket } from 'socket.io';
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { RedisService } from '../redis/redis.service';
@@ -16,6 +17,11 @@ import { Model } from 'mongoose';
 import { Session, SessionDocument } from '../database/schemas/session.schema';
 import { Agent, AgentDocument } from '../database/schemas/agent.schema';
 import { WorkspaceService } from './workspace.service';
+import {
+  BroadcastMessageEnvelope,
+  DirectMessageEnvelope,
+  MessagingAck,
+} from './messaging.types';
 
 @WebSocketGateway({ cors: true })
 @Injectable()
@@ -26,6 +32,19 @@ export class AgentGateway
   server: Server;
 
   private readonly logger = new Logger(AgentGateway.name);
+  private readonly maxPayloadBytes = Number(
+    process.env.AGENT_MSG_MAX_BYTES || 16 * 1024,
+  );
+  private readonly rateLimitWindowMs = Number(
+    process.env.AGENT_MSG_RATE_WINDOW_MS || 10_000,
+  );
+  private readonly rateLimitMaxEvents = Number(
+    process.env.AGENT_MSG_RATE_MAX || 30,
+  );
+  private readonly rateCounters = new Map<
+    string,
+    { windowStart: number; count: number }
+  >();
 
   constructor(
     private redisService: RedisService,
@@ -38,23 +57,104 @@ export class AgentGateway
   async onModuleInit() {
     // Subscribe to redis for pub/sub broadcasting
     await this.redisService.subscribe('agent-broadcasts', (message) => {
-      const parsed = JSON.parse(message) as {
-        topic: string;
-        payload: unknown;
-        senderId?: string;
-      };
-      this.server.to(parsed.topic).emit('broadcast', parsed);
+      try {
+        const parsed = JSON.parse(message) as BroadcastMessageEnvelope;
+        this.server.to(parsed.topic).emit('broadcast', parsed);
+      } catch (error) {
+        this.logger.warn(
+          `Skipping invalid broadcast message from redis: ${(error as Error).message}`,
+        );
+      }
     });
 
     // Subscribe to direct messages
     await this.redisService.subscribe('agent-direct', (message) => {
-      const parsed = JSON.parse(message) as {
-        targetId: string;
-        payload: unknown;
-        senderId?: string;
-      };
-      this.server.to(`agent-${parsed.targetId}`).emit('direct-message', parsed);
+      try {
+        const parsed = JSON.parse(message) as DirectMessageEnvelope;
+        this.server.to(`agent-${parsed.targetId}`).emit('direct-message', parsed);
+      } catch (error) {
+        this.logger.warn(
+          `Skipping invalid direct message from redis: ${(error as Error).message}`,
+        );
+      }
     });
+  }
+
+  private acceptedAck(messageId: string): MessagingAck {
+    return {
+      success: true,
+      status: 'accepted',
+      semantics: 'accepted-for-routing-only',
+      messageId,
+    };
+  }
+
+  private rejectedAck(code: NonNullable<MessagingAck['code']>, error: string): MessagingAck {
+    return {
+      success: false,
+      status: 'rejected',
+      semantics: 'accepted-for-routing-only',
+      code,
+      error,
+    };
+  }
+
+  private enforceRateLimit(senderId: string, eventName: string): MessagingAck | null {
+    const key = `${senderId}:${eventName}`;
+    const now = Date.now();
+    const current = this.rateCounters.get(key);
+
+    if (!current || now - current.windowStart >= this.rateLimitWindowMs) {
+      this.rateCounters.set(key, { windowStart: now, count: 1 });
+      return null;
+    }
+
+    if (current.count >= this.rateLimitMaxEvents) {
+      return this.rejectedAck(
+        'RATE_LIMITED',
+        `Too many ${eventName} events in ${this.rateLimitWindowMs}ms window`,
+      );
+    }
+
+    current.count += 1;
+    return null;
+  }
+
+  private payloadByteSize(payload: unknown): number {
+    return Buffer.byteLength(JSON.stringify(payload ?? null), 'utf8');
+  }
+
+  private validateTopic(topic: unknown): string | null {
+    if (typeof topic !== 'string') return null;
+    const trimmed = topic.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  private validateTargetId(targetId: unknown): string | null {
+    if (typeof targetId !== 'string') return null;
+    const trimmed = targetId.trim();
+    return trimmed.length > 0 ? trimmed : null;
+  }
+
+  private validatePayload(payload: unknown): MessagingAck | null {
+    if (payload === undefined) {
+      return this.rejectedAck('INVALID_PAYLOAD', 'payload is required');
+    }
+
+    const bytes = this.payloadByteSize(payload);
+    if (bytes > this.maxPayloadBytes) {
+      return this.rejectedAck(
+        'PAYLOAD_TOO_LARGE',
+        `payload exceeds ${this.maxPayloadBytes} bytes`,
+      );
+    }
+
+    return null;
+  }
+
+  private getSenderId(client: Socket): string | null {
+    const senderId = (client.data as { agentId?: string }).agentId;
+    return typeof senderId === 'string' && senderId.length > 0 ? senderId : null;
   }
 
   async handleConnection(client: Socket) {
@@ -103,18 +203,41 @@ export class AgentGateway
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { topic: string },
   ) {
-    await client.join(data.topic);
-    return { success: true, topic: data.topic };
+    const topic = this.validateTopic(data?.topic);
+    if (!topic) {
+      return this.rejectedAck('INVALID_PAYLOAD', 'topic must be a non-empty string');
+    }
+
+    await client.join(topic);
+    return { ...this.acceptedAck(randomUUID()), topic };
   }
 
   @SubscribeMessage('broadcast')
   async handleBroadcast(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { topic: string; payload: unknown },
-  ) {
-    const message = {
-      senderId: (client.data as { agentId: string }).agentId,
-      topic: data.topic,
+    @MessageBody() data: { topic?: unknown; payload?: unknown },
+  ): Promise<MessagingAck> {
+    const senderId = this.getSenderId(client);
+    if (!senderId) {
+      return this.rejectedAck('UNAUTHORIZED', 'sender is not authenticated');
+    }
+
+    const rateLimitError = this.enforceRateLimit(senderId, 'broadcast');
+    if (rateLimitError) return rateLimitError;
+
+    const topic = this.validateTopic(data?.topic);
+    if (!topic) {
+      return this.rejectedAck('INVALID_PAYLOAD', 'topic must be a non-empty string');
+    }
+
+    const payloadError = this.validatePayload(data?.payload);
+    if (payloadError) return payloadError;
+
+    const message: BroadcastMessageEnvelope = {
+      messageId: randomUUID(),
+      type: 'broadcast',
+      senderId,
+      topic,
       payload: data.payload,
       timestamp: new Date().toISOString(),
     };
@@ -123,61 +246,148 @@ export class AgentGateway
       'agent-broadcasts',
       JSON.stringify(message),
     );
-    return { success: true };
+    return this.acceptedAck(message.messageId);
   }
 
   @SubscribeMessage('direct-message')
   async handleDirectMessage(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { targetId: string; payload: unknown },
-  ) {
-    const message = {
-      senderId: (client.data as { agentId: string }).agentId,
-      targetId: data.targetId,
+    @MessageBody() data: { targetId?: unknown; payload?: unknown },
+  ): Promise<MessagingAck> {
+    const senderId = this.getSenderId(client);
+    if (!senderId) {
+      return this.rejectedAck('UNAUTHORIZED', 'sender is not authenticated');
+    }
+
+    const rateLimitError = this.enforceRateLimit(senderId, 'direct-message');
+    if (rateLimitError) return rateLimitError;
+
+    const targetId = this.validateTargetId(data?.targetId);
+    if (!targetId) {
+      return this.rejectedAck('INVALID_PAYLOAD', 'targetId must be a non-empty string');
+    }
+
+    const payloadError = this.validatePayload(data?.payload);
+    if (payloadError) return payloadError;
+
+    const targetSession = await this.redisService.getSession(targetId);
+    if (!targetSession) {
+      return this.rejectedAck('TARGET_OFFLINE', `target agent ${targetId} is offline`);
+    }
+
+    const message: DirectMessageEnvelope = {
+      messageId: randomUUID(),
+      type: 'direct-message',
+      senderId,
+      targetId,
       payload: data.payload,
       timestamp: new Date().toISOString(),
     };
 
     await this.redisService.publish('agent-direct', JSON.stringify(message));
-    return { success: true };
+    return this.acceptedAck(message.messageId);
   }
 
   @SubscribeMessage('request-help')
   async handleRequestHelp(
     @ConnectedSocket() client: Socket,
     @MessageBody()
-    data: { taskDescription: string; requiredCapabilities: string[] },
-  ) {
-    const message = {
+    data: { taskDescription?: unknown; requiredCapabilities?: unknown },
+  ): Promise<MessagingAck> {
+    const senderId = this.getSenderId(client);
+    if (!senderId) {
+      return this.rejectedAck('UNAUTHORIZED', 'sender is not authenticated');
+    }
+
+    const rateLimitError = this.enforceRateLimit(senderId, 'request-help');
+    if (rateLimitError) return rateLimitError;
+
+    if (typeof data?.taskDescription !== 'string' || data.taskDescription.trim().length === 0) {
+      return this.rejectedAck(
+        'INVALID_PAYLOAD',
+        'taskDescription must be a non-empty string',
+      );
+    }
+
+    const capabilities = Array.isArray(data?.requiredCapabilities)
+      ? data.requiredCapabilities.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : null;
+
+    if (!capabilities) {
+      return this.rejectedAck(
+        'INVALID_PAYLOAD',
+        'requiredCapabilities must be an array of strings',
+      );
+    }
+
+    const message: BroadcastMessageEnvelope = {
+      messageId: randomUUID(),
       type: 'request-help',
-      senderId: (client.data as { agentId: string }).agentId,
-      taskDescription: data.taskDescription,
-      requiredCapabilities: data.requiredCapabilities,
+      senderId,
+      topic: 'global',
+      payload: {
+        taskDescription: data.taskDescription.trim(),
+        requiredCapabilities: capabilities,
+      },
       timestamp: new Date().toISOString(),
     };
+
     await this.redisService.publish(
       'agent-broadcasts',
-      JSON.stringify({ topic: 'global', payload: message }),
+      JSON.stringify(message),
     );
-    return { success: true };
+    return this.acceptedAck(message.messageId);
   }
 
   @SubscribeMessage('accept-task')
   async handleAcceptTask(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { requesterId: string; taskId: string },
-  ) {
-    const message = {
+    @MessageBody() data: { requesterId?: unknown; taskId?: unknown },
+  ): Promise<MessagingAck> {
+    const senderId = this.getSenderId(client);
+    if (!senderId) {
+      return this.rejectedAck('UNAUTHORIZED', 'sender is not authenticated');
+    }
+
+    const rateLimitError = this.enforceRateLimit(senderId, 'accept-task');
+    if (rateLimitError) return rateLimitError;
+
+    const requesterId = this.validateTargetId(data?.requesterId);
+    if (!requesterId) {
+      return this.rejectedAck(
+        'INVALID_PAYLOAD',
+        'requesterId must be a non-empty string',
+      );
+    }
+
+    if (typeof data?.taskId !== 'string' || data.taskId.trim().length === 0) {
+      return this.rejectedAck('INVALID_PAYLOAD', 'taskId must be a non-empty string');
+    }
+
+    const requesterSession = await this.redisService.getSession(requesterId);
+    if (!requesterSession) {
+      return this.rejectedAck(
+        'TARGET_OFFLINE',
+        `target agent ${requesterId} is offline`,
+      );
+    }
+
+    const message: DirectMessageEnvelope = {
+      messageId: randomUUID(),
       type: 'accept-task',
-      senderId: (client.data as { agentId: string }).agentId,
-      taskId: data.taskId,
+      senderId,
+      targetId: requesterId,
+      payload: {
+        taskId: data.taskId.trim(),
+      },
       timestamp: new Date().toISOString(),
     };
+
     await this.redisService.publish(
       'agent-direct',
-      JSON.stringify({ targetId: data.requesterId, payload: message }),
+      JSON.stringify(message),
     );
-    return { success: true };
+    return this.acceptedAck(message.messageId);
   }
 
   @SubscribeMessage('workspace-write')
