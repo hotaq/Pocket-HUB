@@ -1,0 +1,12 @@
+{
+  "name": "openclaw-core-mock",
+  "private": true,
+  "scripts": {
+    "test:smoke": "node test.js"
+  },
+  "dependencies": {
+    "axios": "latest",
+    "socket.io-client": "latest",
+    "commander": "latest"
+  }
+}
