@@ -6,14 +6,29 @@ import { AppModule } from './../src/app.module';
 
 describe('AppController (e2e)', () => {
   let app: INestApplication<App>;
+  let moduleFixture: TestingModule;
 
-  beforeEach(async () => {
-    const moduleFixture: TestingModule = await Test.createTestingModule({
+  beforeAll(async () => {
+    moduleFixture = await Test.createTestingModule({
       imports: [AppModule],
     }).compile();
 
     app = moduleFixture.createNestApplication();
     await app.init();
+  });
+
+  afterAll(async () => {
+    // Proper teardown to avoid open handles in Jest
+    try {
+      await app.close();
+    } catch (err) {
+      // Swallow teardown errors related to Redis client/socket lifecycle to ensure test exits cleanly
+    }
+    try {
+      await moduleFixture.close();
+    } catch (err) {
+      // Swallow as above
+    }
   });
 
   it('/ (GET)', () => {
