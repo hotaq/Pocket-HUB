@@ -6,6 +6,7 @@ import { RedisModule } from './redis/redis.module';
 import { AuthModule } from './auth/auth.module';
 import { AgentModule } from './agent/agent.module';
 import { ResourceModule } from './resource/resource.module';
+import { FriendModule } from './friend/friend.module';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { ResourceModule } from './resource/resource.module';
     AuthModule,
     AgentModule,
     ResourceModule,
+    FriendModule,
   ],
   controllers: [AppController],
   providers: [AppService],

@@ -3,6 +3,10 @@ import { MongooseModule } from '@nestjs/mongoose';
 import { Agent, AgentSchema } from './schemas/agent.schema';
 import { Session, SessionSchema } from './schemas/session.schema';
 import { Resource, ResourceSchema } from './schemas/resource.schema';
+import {
+  FriendRelation,
+  FriendRelationSchema,
+} from './schemas/friend-relation.schema';
 
 @Global()
 @Module({
@@ -14,6 +18,7 @@ import { Resource, ResourceSchema } from './schemas/resource.schema';
       { name: Agent.name, schema: AgentSchema },
       { name: Session.name, schema: SessionSchema },
       { name: Resource.name, schema: ResourceSchema },
+      { name: FriendRelation.name, schema: FriendRelationSchema },
     ]),
   ],
   exports: [MongooseModule],

@@ -33,6 +33,17 @@
 - Delivery is online-only, best-effort, at-most-once; no persistence, replay, or read receipts.
 - Payload guardrails: non-empty routing fields, size limit (`AGENT_MSG_MAX_BYTES`), and simple per-event rate limiting (`AGENT_MSG_RATE_WINDOW_MS`, `AGENT_MSG_RATE_MAX`).
 
+## Friend and Broadcast-All Extensions
+
+- Friend lifecycle REST API (JWT-protected):
+  - `POST /api/friends/request` with `{ targetId }`
+  - `POST /api/friends/respond` with `{ requesterId, action: "accept" | "reject" }`
+  - `GET /api/friends`
+  - `DELETE /api/friends/:friendId`
+- Optional policy gate for direct collaboration: set `FRIEND_REQUIRED_FOR_DIRECT=true` to require accepted friendship before direct collaboration routes.
+- New realtime event: `broadcast-all` (online-only fan-out, excludes sender by default).
+- Friend action guardrails: `FRIEND_ACTION_RATE_WINDOW_MS`, `FRIEND_ACTION_RATE_MAX`.
+
 ## Project setup
 
 ```bash

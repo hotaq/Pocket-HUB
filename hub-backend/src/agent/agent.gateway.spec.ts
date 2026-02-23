@@ -6,6 +6,7 @@ import { RedisService } from '../redis/redis.service';
 import { WorkspaceService } from './workspace.service';
 import { SessionDocument } from '../database/schemas/session.schema';
 import { AgentDocument } from '../database/schemas/agent.schema';
+import { FriendService } from '../friend/friend.service';
 
 const buildClient = (agentId?: string): Socket =>
   ({
@@ -21,6 +22,7 @@ describe('AgentGateway messaging', () => {
       'publish' | 'subscribe' | 'getSession' | 'setSession' | 'removeSession'
     >
   >;
+  let friendServiceMock: jest.Mocked<Pick<FriendService, 'areFriends'>>;
 
   beforeEach(() => {
     redisMock = {
@@ -34,10 +36,15 @@ describe('AgentGateway messaging', () => {
       removeSession: jest.fn(async (_agentId: string) => undefined),
     };
 
+    friendServiceMock = {
+      areFriends: jest.fn(async (_a: string, _b: string) => true),
+    };
+
     gateway = new AgentGateway(
       redisMock as unknown as RedisService,
       {} as JwtService,
       {} as WorkspaceService,
+      friendServiceMock as unknown as FriendService,
       {} as Model<SessionDocument>,
       {} as Model<AgentDocument>,
     );
@@ -132,6 +139,7 @@ describe('AgentGateway messaging', () => {
         redisMock as unknown as RedisService,
         {} as JwtService,
         {} as WorkspaceService,
+        friendServiceMock as unknown as FriendService,
         {} as Model<SessionDocument>,
         {} as Model<AgentDocument>,
       );
@@ -171,5 +179,58 @@ describe('AgentGateway messaging', () => {
     expect(parsed.type).toBe('request-help');
     expect(parsed.topic).toBe('global');
     expect(parsed.payload.taskDescription).toBe('Need assistance');
+  });
+
+  it('routes broadcast-all with accepted ack semantics', async () => {
+    const ack = await gateway.handleBroadcastAll(buildClient('agent-1'), {
+      payload: { notice: 'hello everyone' },
+      includeSender: false,
+    });
+
+    expect(ack.success).toBe(true);
+    expect(redisMock.publish).toHaveBeenCalledTimes(1);
+
+    const [channel, payload] = redisMock.publish.mock.calls[0];
+    expect(channel).toBe('agent-broadcast-all');
+    const parsed = JSON.parse(payload) as {
+      type: string;
+      senderId: string;
+      payload: { notice: string };
+    };
+    expect(parsed.type).toBe('broadcast-all');
+    expect(parsed.senderId).toBe('agent-1');
+    expect(parsed.payload.notice).toBe('hello everyone');
+  });
+
+  it('rejects direct-message when friend policy is enabled and relation is missing', async () => {
+    const previousPolicy = process.env.FRIEND_REQUIRED_FOR_DIRECT;
+    process.env.FRIEND_REQUIRED_FOR_DIRECT = 'true';
+    friendServiceMock.areFriends.mockResolvedValueOnce(false);
+
+    try {
+      gateway = new AgentGateway(
+        redisMock as unknown as RedisService,
+        {} as JwtService,
+        {} as WorkspaceService,
+        friendServiceMock as unknown as FriendService,
+        {} as Model<SessionDocument>,
+        {} as Model<AgentDocument>,
+      );
+
+      const ack = await gateway.handleDirectMessage(buildClient('sender-1'), {
+        targetId: 'receiver-1',
+        payload: { content: 'blocked' },
+      });
+
+      expect(ack.success).toBe(false);
+      expect(ack.code).toBe('FRIENDSHIP_REQUIRED');
+      expect(redisMock.publish).not.toHaveBeenCalled();
+    } finally {
+      if (previousPolicy === undefined) {
+        delete process.env.FRIEND_REQUIRED_FOR_DIRECT;
+      } else {
+        process.env.FRIEND_REQUIRED_FOR_DIRECT = previousPolicy;
+      }
+    }
   });
 });

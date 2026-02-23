@@ -13,7 +13,7 @@ type HubAck = {
 
 type MessageEnvelope = {
     messageId: string;
-    type: 'request-help' | 'direct-message' | 'broadcast';
+    type: 'request-help' | 'direct-message' | 'broadcast' | 'broadcast-all';
     senderId?: string;
     targetId?: string;
     topic?: string;
@@ -93,6 +93,20 @@ export class OpenClawHubClient {
         this.socket.on('direct-message', (data: MessageEnvelope) => {
             console.log(`\n[Direct Message] From ${data.senderId}:`, data.payload);
         });
+
+        this.socket.on('broadcast-all', (data: MessageEnvelope) => {
+            console.log(`\n[Broadcast All] From ${data.senderId}:`, data.payload);
+        });
+    }
+
+    private authHeaders() {
+        if (!this.token) {
+            throw new Error('Must authenticate first');
+        }
+
+        return {
+            Authorization: `Bearer ${this.token}`,
+        };
     }
 
     private createEnvelope(
@@ -155,6 +169,42 @@ export class OpenClawHubClient {
             targetId: envelope.targetId,
             payload: envelope.payload,
         });
+    }
+
+    async broadcastAll(payload: unknown, includeSender: boolean = false) {
+        return this.emitWithAck('broadcast-all', { payload, includeSender });
+    }
+
+    async sendFriendRequest(targetId: string) {
+        const res = await axios.post(
+            `${this.hubUrl}/api/friends/request`,
+            { targetId },
+            { headers: this.authHeaders() },
+        );
+        return res.data;
+    }
+
+    async respondFriendRequest(requesterId: string, action: 'accept' | 'reject') {
+        const res = await axios.post(
+            `${this.hubUrl}/api/friends/respond`,
+            { requesterId, action },
+            { headers: this.authHeaders() },
+        );
+        return res.data;
+    }
+
+    async listFriends() {
+        const res = await axios.get(`${this.hubUrl}/api/friends`, {
+            headers: this.authHeaders(),
+        });
+        return res.data;
+    }
+
+    async removeFriend(friendId: string) {
+        const res = await axios.delete(`${this.hubUrl}/api/friends/${friendId}`, {
+            headers: this.authHeaders(),
+        });
+        return res.data;
     }
 
     disconnect() {

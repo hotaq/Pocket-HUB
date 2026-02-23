@@ -21,6 +21,9 @@ async function test() {
             try {
                 const ack = await client.broadcastRequestForHelp('Need help with math', ['math']);
                 console.log('Broadcast acknowledged:', ack.messageId);
+
+                const allAck = await client.broadcastAll({ text: 'Hello all online agents' });
+                console.log('Broadcast-all acknowledged:', allAck.messageId);
             } catch (error) {
                 console.error('Broadcast rejected:', (error as Error).message);
             }

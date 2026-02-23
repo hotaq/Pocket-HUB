@@ -53,4 +53,54 @@ program.command('connect')
         }
     });
 
+program.command('friend-request')
+    .description('Send a friend request to another agent id')
+    .requiredOption('-n, --name <name>', 'agent name')
+    .requiredOption('-t, --token <token>', 'agent token')
+    .argument('<targetId>', 'target agent id')
+    .action(async (targetId: string, options: any) => {
+        const success = await client.authenticate(options.name, options.token);
+        if (!success) return;
+        const result = await client.sendFriendRequest(targetId);
+        console.log(result);
+    });
+
+program.command('friend-respond')
+    .description('Accept or reject a friend request')
+    .requiredOption('-n, --name <name>', 'agent name')
+    .requiredOption('-t, --token <token>', 'agent token')
+    .argument('<requesterId>', 'requester agent id')
+    .argument('<action>', 'accept or reject')
+    .action(async (requesterId: string, action: 'accept' | 'reject', options: any) => {
+        const success = await client.authenticate(options.name, options.token);
+        if (!success) return;
+        const result = await client.respondFriendRequest(requesterId, action);
+        console.log(result);
+    });
+
+program.command('friends')
+    .description('List current authenticated agent friends')
+    .requiredOption('-n, --name <name>', 'agent name')
+    .requiredOption('-t, --token <token>', 'agent token')
+    .action(async (options: any) => {
+        const success = await client.authenticate(options.name, options.token);
+        if (!success) return;
+        const result = await client.listFriends();
+        console.log(result);
+    });
+
+program.command('broadcast-all')
+    .description('Broadcast a message to all online agents')
+    .requiredOption('-n, --name <name>', 'agent name')
+    .requiredOption('-t, --token <token>', 'agent token')
+    .argument('<message>', 'message text')
+    .action(async (message: string, options: any) => {
+        const success = await client.authenticate(options.name, options.token);
+        if (!success) return;
+        await client.connectWebSocket();
+        const ack = await client.broadcastAll({ text: message });
+        console.log(ack);
+        client.disconnect();
+    });
+
 program.parseAsync();

@@ -18,10 +18,12 @@ import { Session, SessionDocument } from '../database/schemas/session.schema';
 import { Agent, AgentDocument } from '../database/schemas/agent.schema';
 import { WorkspaceService } from './workspace.service';
 import {
+  BroadcastAllMessageEnvelope,
   BroadcastMessageEnvelope,
   DirectMessageEnvelope,
   MessagingAck,
 } from './messaging.types';
+import { FriendService } from '../friend/friend.service';
 
 @WebSocketGateway({ cors: true })
 @Injectable()
@@ -41,6 +43,9 @@ export class AgentGateway
   private readonly rateLimitMaxEvents = Number(
     process.env.AGENT_MSG_RATE_MAX || 30,
   );
+  private readonly friendRequiredForDirect =
+    String(process.env.FRIEND_REQUIRED_FOR_DIRECT || 'false').toLowerCase() ===
+    'true';
   private readonly rateCounters = new Map<
     string,
     { windowStart: number; count: number }
@@ -50,6 +55,7 @@ export class AgentGateway
     private redisService: RedisService,
     private jwtService: JwtService,
     private workspaceService: WorkspaceService,
+    private friendService: FriendService,
     @InjectModel(Session.name) private sessionModel: Model<SessionDocument>,
     @InjectModel(Agent.name) private agentModel: Model<AgentDocument>,
   ) {}
@@ -75,6 +81,23 @@ export class AgentGateway
       } catch (error) {
         this.logger.warn(
           `Skipping invalid direct message from redis: ${(error as Error).message}`,
+        );
+      }
+    });
+
+    await this.redisService.subscribe('agent-broadcast-all', (message) => {
+      try {
+        const parsed = JSON.parse(message) as BroadcastAllMessageEnvelope;
+        if (parsed.includeSender) {
+          this.server.emit('broadcast-all', parsed);
+          return;
+        }
+        this.server
+          .except(`agent-${parsed.senderId}`)
+          .emit('broadcast-all', parsed);
+      } catch (error) {
+        this.logger.warn(
+          `Skipping invalid broadcast-all message from redis: ${(error as Error).message}`,
         );
       }
     });
@@ -155,6 +178,25 @@ export class AgentGateway
   private getSenderId(client: Socket): string | null {
     const senderId = (client.data as { agentId?: string }).agentId;
     return typeof senderId === 'string' && senderId.length > 0 ? senderId : null;
+  }
+
+  private async enforceFriendPolicy(
+    senderId: string,
+    targetId: string,
+  ): Promise<MessagingAck | null> {
+    if (!this.friendRequiredForDirect) {
+      return null;
+    }
+
+    const isFriend = await this.friendService.areFriends(senderId, targetId);
+    if (isFriend) {
+      return null;
+    }
+
+    return this.rejectedAck(
+      'FRIENDSHIP_REQUIRED',
+      'direct collaboration requires an accepted friend relation',
+    );
   }
 
   async handleConnection(client: Socket) {
@@ -249,6 +291,38 @@ export class AgentGateway
     return this.acceptedAck(message.messageId);
   }
 
+  @SubscribeMessage('broadcast-all')
+  async handleBroadcastAll(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { payload?: unknown; includeSender?: unknown },
+  ): Promise<MessagingAck> {
+    const senderId = this.getSenderId(client);
+    if (!senderId) {
+      return this.rejectedAck('UNAUTHORIZED', 'sender is not authenticated');
+    }
+
+    const rateLimitError = this.enforceRateLimit(senderId, 'broadcast-all');
+    if (rateLimitError) return rateLimitError;
+
+    const payloadError = this.validatePayload(data?.payload);
+    if (payloadError) return payloadError;
+
+    const message: BroadcastAllMessageEnvelope = {
+      messageId: randomUUID(),
+      type: 'broadcast-all',
+      senderId,
+      payload: data.payload,
+      includeSender: data?.includeSender === true,
+      timestamp: new Date().toISOString(),
+    };
+
+    await this.redisService.publish(
+      'agent-broadcast-all',
+      JSON.stringify(message),
+    );
+    return this.acceptedAck(message.messageId);
+  }
+
   @SubscribeMessage('direct-message')
   async handleDirectMessage(
     @ConnectedSocket() client: Socket,
@@ -269,6 +343,9 @@ export class AgentGateway
 
     const payloadError = this.validatePayload(data?.payload);
     if (payloadError) return payloadError;
+
+    const friendshipError = await this.enforceFriendPolicy(senderId, targetId);
+    if (friendshipError) return friendshipError;
 
     const targetSession = await this.redisService.getSession(targetId);
     if (!targetSession) {
@@ -363,6 +440,9 @@ export class AgentGateway
     if (typeof data?.taskId !== 'string' || data.taskId.trim().length === 0) {
       return this.rejectedAck('INVALID_PAYLOAD', 'taskId must be a non-empty string');
     }
+
+    const friendshipError = await this.enforceFriendPolicy(senderId, requesterId);
+    if (friendshipError) return friendshipError;
 
     const requesterSession = await this.redisService.getSession(requesterId);
     if (!requesterSession) {

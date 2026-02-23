@@ -1,5 +1,6 @@
 export type AgentMessageType =
   | 'broadcast'
+  | 'broadcast-all'
   | 'direct-message'
   | 'request-help'
   | 'accept-task';
@@ -20,6 +21,10 @@ export interface DirectMessageEnvelope extends BaseAgentMessageEnvelope {
   targetId: string;
 }
 
+export interface BroadcastAllMessageEnvelope extends BaseAgentMessageEnvelope {
+  includeSender?: boolean;
+}
+
 export interface MessagingAck {
   success: boolean;
   status: 'accepted' | 'rejected';
@@ -29,7 +34,8 @@ export interface MessagingAck {
     | 'INVALID_PAYLOAD'
     | 'PAYLOAD_TOO_LARGE'
     | 'RATE_LIMITED'
-    | 'TARGET_OFFLINE';
+    | 'TARGET_OFFLINE'
+    | 'FRIENDSHIP_REQUIRED';
   error?: string;
   messageId?: string;
 }
